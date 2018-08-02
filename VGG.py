@@ -12,18 +12,26 @@ class VGG16():
         self.skip_fc = True
         self.features = ['block04', 'block07', 'block08', 'block09', 'block10', 'block11']
         self.feat_shapes = [(38, 38), (19, 19), (10, 10), (5, 5), (3, 3), (1, 1)]
-        self.anchor_sizes = [ (21., 45.)    ,
-                              (45., 99.)    ,
-                              (99., 153.)   ,  
-                              (153., 207.)  ,
-                              (207., 261.)  ,
-                              (261., 315.)  ]
+        self.anchor_sizes = [ (12., 16.)    ,
+                             (16., 32.)    ,
+                              (32., 64.)   ,  
+                              (64., 128.)  ,
+                              (128., 196.)  ,
+                              (224., 325.)  ]
         self.anchor_ratios =   [ [2, 0.5]         ,
                                [2, 0.5, 3, 1./3],
-                               [2, 0.5, 3, 1./3],
+                              [2, 0.5, 3, 1./3],
                                [2, 0.5, 3, 1./3],
                                [2, 0.5],
-                               [2, 0.5] ]
+                              [2, 0.5] ]
+        #self.features = ['block03','block04', 'block07', 'block08', 'block09', 'block10', 'block11']
+        #self.feat_shapes = [(75,75),(38, 38), (19, 19), (10, 10), (5, 5), (3, 3), (1, 1)]
+        #self.anchor_sizes = [ (),(21., 45.)    ,
+        #                      (45., 99.)    ,
+        #                      (99., 153.)   ,  
+        #                      (153., 207.)  ,
+        #                      (207., 261.)  ,
+        #                      (261., 315.)  ]                               
         self.anchor_steps = [8, 16, 32, 64, 100, 300]
         ### Dataset  Specific ###
         self.num_classes = 21
@@ -110,6 +118,7 @@ class SSD300(VGG16):
         #self.base = 
         super(SSD300,self).__init__()
         self.match_threshold = 0.5
+        self.negative_ratio  = 5
         
         
         
@@ -137,11 +146,7 @@ class SSD300(VGG16):
                 self.predictions.append(slim.softmax(cp))
                 self.localizations.append(lp)
         
-    def _get_losses(self):
-        with tf.name_scope('ssd_losses'):
-            lshape = tensor_shape(self.logits[0],5)
-            f_logits = []
-            f_
+    
             
         
     def tensor_shape(self,x, rank=3):
@@ -155,6 +160,7 @@ class SSD300(VGG16):
     def _get_anchor_one_layer(self,feat_shape,sizes,ratios,step,offset = 0):
         dtype = np.float32
         img_shape = self.img_shape
+    
         y, x = np.mgrid[0:feat_shape[0], 0:feat_shape[1]]
         y = (y.astype(dtype) + offset) / feat_shape[0]
         x = (x.astype(dtype) + offset) / feat_shape[1]
@@ -188,11 +194,14 @@ class SSD300(VGG16):
     def _get_anchor_all_layers(self):
         self.layers_anchors = []
         for i,s in enumerate(self.feat_shapes):
-            anchor_box = self._get_anchor_one_layer(s,self.anchor_sizes[i], self.anchor_ratios[i],0)
+            anchor_box = self._get_anchor_one_layer(s,self.anchor_sizes[i], self.anchor_ratios[i],0,offset=0)
             self.layers_anchors.append(anchor_box)
             
-    def _bboxes_encode_layer(self,labels,bboxes,anchor_layer,dtype=np.float32):
+    def _bboxes_encode_layer(self,labels,bboxes,anchor_layer,feat_shape,dtype=np.float32,offset=0):
         yref, xref, href, wref = anchor_layer
+        if offset>0:
+            yref = yref + offset/feat_shape[0]
+            xref = xref + offset/feat_shape[1]
         ymin = yref - href / 2.
         xmin = xref - wref / 2.
         ymax = yref + href / 2.
@@ -270,17 +279,166 @@ class SSD300(VGG16):
         #feat_localization = [feat_xmin,feat_ymin,feat_xmax,feat_ymax]
         return feat_labels,feat_localization,feat_scores
         
-    def _bboxes_encode(self,labels,bboxes):
+    def _bboxes_encode(self,labels,bboxes,offset=0):
         target_labels = []
         target_localizations = []
         target_scores = []
         for j in range(len(self.layers_anchors)):
-            with tf.name_scope('bboxes_encode_block_%j' % j):
-                feat_labels,feat_localization,feat_scores=ssd._bboxes_encode_layer(labels,bboxes,ssd.layers_anchors[j])
+            with tf.name_scope('bboxes_encode_block_{}'.format(j)):
+                feat_labels,feat_localization,feat_scores   =self._bboxes_encode_layer(labels,bboxes,self.layers_anchors[j],self.feat_shapes[j],offset=0)
+                for offset in [0.25,0.5,0.75]:
+                    feat_labels2,feat_localization2,feat_scores2=self._bboxes_encode_layer(labels,bboxes,self.layers_anchors[j],self.feat_shapes[j],offset=offset)
+                    
+                    feat_mask2            = np.logical_and(feat_labels2>0,feat_scores<0.5)
+                    feat_labels           = np.where(feat_mask2,feat_labels2         ,feat_labels)
+                    feat_localization[0]  = np.where(feat_mask2,feat_localization2[0],feat_localization[0])
+                    feat_localization[1]  = np.where(feat_mask2,feat_localization2[1],feat_localization[1])
+                    feat_localization[2]  = np.where(feat_mask2,feat_localization2[2],feat_localization[2])
+                    feat_localization[3]  = np.where(feat_mask2,feat_localization2[3],feat_localization[3])
+                    feat_scores           = np.where(feat_mask2,feat_scores2         ,feat_scores)
+
                 target_labels.append(feat_labels)
                 target_localizations.append(feat_localization)
                 target_scores.append(feat_scores)
-        return target_labels,target_localizations,feat_scores
+        return target_labels,target_localizations,target_scores
+    def _flatten_encoded(self,target_labels,target_localizations,target_scores):
+        target_labels_flat = []
+        for i in range(len(target_labels)):
+            target_labels_flat.append(np.reshape(target_labels[i],[-1]))
+        target_labels_flat=np.concatenate(target_labels_flat,axis=0)
+
+        target_localizations_flat = []
+        for i in range(len(target_localizations)):
+            target_localizations_flat.append(np.reshape(target_localizations[i],[-1,4]))
+        target_localizations_flat=np.concatenate(target_localizations_flat,axis=0)
+
+        target_scores_flat = []
+        for i in range(len(target_localizations)):
+            target_scores_flat.append(np.reshape(target_scores[i],[-1]))
+        target_scores_flat=np.concatenate(target_scores_flat,axis=0)
+        
+        return target_labels_flat,target_localizations_flat,target_scores_flat
+    def _make_batch(self,batch_labels,batch_bboxes):
+        batch_size = self.batch_size
+        batch_labels_flat = []
+        batch_localizations_flat = []
+        batch_scores_flat = []
+        
+        for b in range(len(batch_labels)):
+            labels=batch_labels[b]
+            bboxes=batch_bboxes[b]
+            target_labels,target_localizations,target_scores = self._bboxes_encode(labels,bboxes)
+            target_labels_flat,target_localizations_flat,target_scores_flat = self._flatten_encoded(target_labels,target_localizations,target_scores)
+            
+            batch_labels_flat.append(target_labels_flat)
+            batch_localizations_flat.append(target_localizations_flat)
+            batch_scores_flat.append(target_scores_flat)
+            
+        batch_labels_flat = np.array(batch_labels_flat)
+        batch_localizations_flat = np.array(batch_localizations_flat)
+        batch_scores_flat = np.array(batch_scores_flat)
+        
+        return batch_labels_flat,batch_localizations_flat,batch_scores_flat
+           
+        
+            
+    def _get_losses(self,gt_localization,gt_classes,gt_scores,alpha=1.):
+        num_cls = self.num_classes
+        logits_flat = []
+        localizations_flat = []
+        for t in range(len(self.logits)):
+            logits_flat.append(tf.reshape(self.logits[t],[-1,8732,num_cls]))
+            localizations_flat.append(tf.reshape(self.localizations[t],[-1,8732,4]))
+
+        logits_flat        = tf.concat(logits_flat, axis=0)
+        localizations_flat = tf.concat(localizations_flat, axis=0)
+        logits             = logits_flat
+        with tf.name_scope('ssd_losses'):
+            
+            pos_mask    = gt_scores > self.match_threshold
+            pos_mask_f  = tf.cast(pos_mask,tf.float32)
+            bg_classes  = tf.cast(pos_mask,tf.int32)
+            num_positive= tf.reduce_sum(pos_mask_f)
+            
+            neg_mask    =  tf.logical_not(pos_mask)
+            neg_mask_f  =  tf.cast(neg_mask,tf.float32)
+            num_negative=  num_positive * self.negative_ratio +self.batch_size
+            num_negative=  tf.cast(num_negative,tf.int32)
+            predictions =  slim.softmax(logits)
+            neg_score   =  tf.where(neg_mask,predictions[:,:,0],1-neg_mask_f)
+            #neg_score_flat=tf.reshape(neg_score,[-1])
+            val,idxs      =tf.nn.top_k(-neg_score,k=num_negative)
+            max_hard_pred = -val[-1]
+            neg_mask      = tf.logical_and(neg_mask,neg_score<max_hard_pred)
+            
+            with tf.name_scope('cross_entropy_pos'):
+                loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits,labels=gt_classes)
+                loss = tf.reduce_sum(loss*pos_mask_f)/self.batch_size
+                self.pos_conf_los = loss
+                tf.losses.add_loss(loss)
+            with tf.name_scope('cross_entropy_neg'):
+                loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits,labels=bg_classes)
+                loss = tf.reduce_sum(loss*neg_mask_f)/self.batch_size
+                self.neg_conf_loss = loss
+                tf.losses.add_loss(loss)  
+            with tf.name_scope('localization'):
+                pos_mask_f_loc = tf.expand_dims(pos_mask_f,axis=-1)
+                loss = self.smooth_L1(localizations_flat - gt_localization)
+                loss = tf.reduce_sum(loss*pos_mask_f_loc)/self.batch_size
+                self.loc_loss = loss
+                tf.losses.add_loss(loss)
+            self.total_loss = self.pos_conf_los+self.neg_conf_loss+self.loc_loss
+    def _get_placeholders(self):
+        self.Y_localizations = []
+        self.Y_classes       = []
+        num_cls = self.num_classes
+        #self.y_scores        = []
+
+        Y_class         = tf.placeholder(tf.float32,[None,38,38,4,num_cls],name='Y_class_block04')
+        Y_localization  = tf.placeholder(tf.float32,[None,38,38,4,4]      ,name='Y_local_block04')
+        self.Y_classes.append(Y_class)
+        self.Y_localizations.append(Y_localization)
+
+        Y_class         = tf.placeholder(tf.float32,[None,19,19,8,num_cls],name='Y_class_block07')
+        Y_localization  = tf.placeholder(tf.float32,[None,19,19,8,4]      ,name='Y_local_block07')
+        self.Y_classes.append(Y_class)
+        self.Y_localizations.append(Y_localization)
+
+        Y_class         = tf.placeholder(tf.float32,[None,10,10,8,num_cls],name='Y_class_block08')
+        Y_localization  = tf.placeholder(tf.float32,[None,10,10,8,4]      ,name='Y_local_block08')
+        self.Y_classes.append(Y_class)
+        self.Y_localizations.append(Y_localization)
+
+        Y_class         = tf.placeholder(tf.float32,[None,5,5,8,num_cls],name='Y_class_block09')
+        Y_localization  = tf.placeholder(tf.float32,[None,5,5,8,4]      ,name='Y_local_block09')
+        self.Y_classes.append(Y_class)
+        self.Y_localizations.append(Y_localization)
+
+        Y_class         = tf.placeholder(tf.float32,[None,3,3,4,num_cls],name='Y_class_block10')
+        Y_localization  = tf.placeholder(tf.float32,[None,3,3,4,4]      ,name='Y_local_block10')
+        self.Y_classes.append(Y_class)
+        self.Y_localizations.append(Y_localization)
+
+        Y_class         = tf.placeholder(tf.float32,[None,2,2,4,num_cls],name='Y_class_block11')
+        Y_localization  = tf.placeholder(tf.float32,[None,2,2,4,4]      ,name='Y_local_block11')
+        self.Y_classes.append(Y_class)
+        self.Y_localizations.append(Y_localization)
+        
+        
+    def _generate_gt(self,sess,Y_cls,Y_loc,Y_score):
+        self.gt_localization = sess.run()
+                
+    def smooth_L1(self,x):  
+        absx  = tf.abs(x)
+        minx=tf.minimum(absx,1)
+        r = 0.5 * ((absx - 1) * minx + absx)
+        return r 
+    
+            
+            
+            
+            
+            
 
                 
         

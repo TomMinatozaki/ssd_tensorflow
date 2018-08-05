@@ -2,6 +2,7 @@ import tensorflow as tf
 import numpy as np
 import os 
 import math
+import cv2
 slim = tf.contrib.slim
 class VGG16():
     def __init__(self):
@@ -11,7 +12,7 @@ class VGG16():
         self.padding ='SAME'
         self.skip_fc = True
         self.features = ['block04', 'block07', 'block08', 'block09', 'block10', 'block11']
-        self.feat_shapes = [(38, 38), (19, 19), (10, 10), (5, 5), (3, 3), (1, 1)]
+        self.feat_shapes = [(38, 38), (19, 19), (10, 10), (5, 5), (3, 3), (2, 2)]
         self.anchor_sizes = [ (12., 16.)    ,
                              (16., 32.)    ,
                               (32., 64.)   ,  
@@ -26,7 +27,7 @@ class VGG16():
                               [2, 0.5] ]
         #self.features = ['block03','block04', 'block07', 'block08', 'block09', 'block10', 'block11']
         #self.feat_shapes = [(75,75),(38, 38), (19, 19), (10, 10), (5, 5), (3, 3), (1, 1)]
-        #self.anchor_sizes = [ (),(21., 45.)    ,
+        #self.anchor_sizes = [ (),(21., 45.)    ,4
         #                      (45., 99.)    ,
         #                      (99., 153.)   ,  
         #                      (153., 207.)  ,
@@ -34,7 +35,7 @@ class VGG16():
         #                      (261., 315.)  ]                               
         self.anchor_steps = [8, 16, 32, 64, 100, 300]
         ### Dataset  Specific ###
-        self.num_classes = 21
+        self.num_classes = 24
         self.img_shape = [300,300]
 
         ###Traininig Specification###
@@ -42,6 +43,7 @@ class VGG16():
         
         pass
     def _build(self,X):
+        self.X          = X
         with tf.variable_scope(self.scope) as sc:
             self.end_points = {}
             #with slim.arg_scope([slim.conv2d,slim.max_pool2d],padding='SAME',weights_regularizer=slim.l2_regularizer(0.0005)):
@@ -119,12 +121,16 @@ class SSD300(VGG16):
         super(SSD300,self).__init__()
         self.match_threshold = 0.5
         self.negative_ratio  = 5
-        
+        self.train_data_path = r'D:\Data\VOC2007\VOC2007_train\JPEGImages'
+        self.test_data_path = r'D:\Data\VOC2007\VOC2007_test\JPEGImages'
+        self.Y_cls     = tf.placeholder(tf.int64,[None,8744])
+        self.Y_loc     = tf.placeholder(tf.float32,[None,8744,4])
+        self.Y_score   = tf.placeholder(tf.float32,[None,8744])
         
         
     def _ssd_multibox_layer(self,inputs,anchor_size,anchor_ratio):
         net          =  inputs
-        num_anchors  =  len(anchor_ratio) *len(anchor_size)
+        num_anchors  =  len(anchor_ratio) +len(anchor_size)
         num_loc_pred =  num_anchors * 4
         loc_pred     =  slim.conv2d(net,num_loc_pred,[3,3], activation_fn = None,scope='conv_loc')
         loc_pred     =  tf.reshape(loc_pred,self.tensor_shape(loc_pred,rank=4)[:-1] + [num_anchors , 4] )
@@ -283,6 +289,8 @@ class SSD300(VGG16):
         target_labels = []
         target_localizations = []
         target_scores = []
+        bboxes = np.array(bboxes)
+        bboxes = bboxes/300
         for j in range(len(self.layers_anchors)):
             with tf.name_scope('bboxes_encode_block_{}'.format(j)):
                 feat_labels,feat_localization,feat_scores   =self._bboxes_encode_layer(labels,bboxes,self.layers_anchors[j],self.feat_shapes[j],offset=0)
@@ -318,12 +326,15 @@ class SSD300(VGG16):
         target_scores_flat=np.concatenate(target_scores_flat,axis=0)
         
         return target_labels_flat,target_localizations_flat,target_scores_flat
-    def _make_batch(self,batch_labels,batch_bboxes):
+    def _make_batch(self):
         batch_size = self.batch_size
         batch_labels_flat = []
         batch_localizations_flat = []
         batch_scores_flat = []
         
+        batch_labels = self.batch_labels
+        batch_bboxes = self.batch_bboxes
+      
         for b in range(len(batch_labels)):
             labels=batch_labels[b]
             bboxes=batch_bboxes[b]
@@ -339,20 +350,59 @@ class SSD300(VGG16):
         batch_scores_flat = np.array(batch_scores_flat)
         
         return batch_labels_flat,batch_localizations_flat,batch_scores_flat
-           
-        
-            
-    def _get_losses(self,gt_localization,gt_classes,gt_scores,alpha=1.):
+    def _import_data(self,data_raw,key_list,is_test=False):
+            batch_bboxes = []
+            batch_labels = []
+            batch_imgs   = []
+            data_path = self.train_data_path
+            if is_test:
+                data_path = self.test_data_path
+            for k in range(self.batch_size):
+                key    = key_list[k]
+                bboxes = data_raw[key]['box_coords']
+                labels = data_raw[key]['class']
+                img    = cv2.imread(os.path.join(data_path,key))
+                img    = cv2.resize(img,(300,300))
+                batch_bboxes.append(bboxes)
+                batch_labels.append(labels)
+                batch_imgs.append(img)
+            self.batch_bboxes = batch_bboxes
+            self.batch_labels = batch_labels
+            self.batch_imgs   = batch_imgs
+    def _train_one_step(self,sess,data_raw,key_list,does_print_loss=False):
+        self._import_data(data_raw,key_list)
+        batch_labels_flat,batch_localizations_flat,batch_scores_flat=self._make_batch()
+        feed_dict = {self.X:self.batch_imgs,self.Y_cls:batch_labels_flat,self.Y_loc:batch_localizations_flat,self.Y_score:batch_scores_flat}
+        sess.run(self.optimizer,feed_dict=feed_dict)
+        if does_print_loss:
+            loss_now_total = sess.run(self.total_loss,feed_dict=feed_dict)
+            loss_now_loc   = sess.run(self.loc_loss  ,feed_dict=feed_dict)
+            print('total loss: {} '.format(loss_now_total))
+            print('loc   loss: {} '.format(loss_now_loc))
+    def _get_test_report(self,sess,data_raw_test,key_list_test):
+        self._import_data(data_raw_test,key_list_test)
+        batch_labels_flat,batch_localizations_flat,batch_scores_flat=self._make_batch()
+        feed_dict = {self.X:self.batch_imgs,self.Y_cls:batch_labels_flat,self.Y_loc:batch_localizations_flat,self.Y_score:batch_scores_flat}
+        loss_now_total = sess.run(self.total_loss,feed_dict=feed_dict)
+        loss_now_loc   = sess.run(self.loc_loss  ,feed_dict=feed_dict)
+        print('total loss: {} '.format(loss_now_total))
+        print('loc   loss: {} '.format(loss_now_loc))
+    def _get_losses(self,alpha=1.):
+    
+        gt_localization = self.Y_loc
+        gt_classes      = self.Y_cls
+        gt_scores       = self.Y_score
         num_cls = self.num_classes
         logits_flat = []
         localizations_flat = []
-        for t in range(len(self.logits)):
-            logits_flat.append(tf.reshape(self.logits[t],[-1,8732,num_cls]))
-            localizations_flat.append(tf.reshape(self.localizations[t],[-1,8732,4]))
+        with tf.name_scope('ssd_reshapes'):
+            for t in range(len(self.logits)):
+                logits_flat.append(tf.reshape(self.logits[t],[-1,tf.reduce_prod(self.logits[t].shape[1:4]),num_cls],name='reshape_logit'+str(t)))
+                localizations_flat.append(tf.reshape(self.localizations[t],[-1,tf.reduce_prod(self.localizations[t].shape[1:4]),4],name='reshape_loc'+str(t)))
 
-        logits_flat        = tf.concat(logits_flat, axis=0)
-        localizations_flat = tf.concat(localizations_flat, axis=0)
-        logits             = logits_flat
+            logits_flat        = tf.concat(logits_flat, axis=1)
+            localizations_flat = tf.concat(localizations_flat, axis=1)
+            logits             = logits_flat
         with tf.name_scope('ssd_losses'):
             
             pos_mask    = gt_scores > self.match_threshold
@@ -388,6 +438,10 @@ class SSD300(VGG16):
                 self.loc_loss = loss
                 tf.losses.add_loss(loss)
             self.total_loss = self.pos_conf_los+self.neg_conf_loss+self.loc_loss
+    def _get_optimizer(self,learning_rate=0.0001):
+        self.optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(self.total_loss)
+    def _decode(self):
+        pass
     def _get_placeholders(self):
         self.Y_localizations = []
         self.Y_classes       = []
